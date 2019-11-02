@@ -22,6 +22,28 @@ enable :show_exceptions if development?
 
 set :session_secret, config['cookie_secret']
 
+def csrf_token_matches?(token)
+  token.to_s != '' && token == session[:csrf_token]
+end
+
+def authenticate(installer)
+  if (installer.auth_token = session[:token])
+    begin
+      installer.account
+    rescue RestClient::Unauthorized
+      session[:token] = nil
+      redirect "https://cloud.digitalocean.com/v1/oauth/authorize?response_type=code&client_id=#{CLIENT_ID}&redirect_uri=#{CALLBACK_URL}&scope=read+write"
+    rescue Installer::NoSSHKeyError
+      redirect '/add_ssh_key'
+    else
+      return true
+    end
+  else
+    redirect "https://cloud.digitalocean.com/v1/oauth/authorize?response_type=code&client_id=#{CLIENT_ID}&redirect_uri=#{CALLBACK_URL}&scope=read+write"
+  end
+  false
+end
+
 get '/' do
   @configured = config['client_id'] != 'your-do-client-id'
   haml :index
@@ -41,32 +63,44 @@ get '/install' do
   rescue Installer::ConfigParseError
     haml :error_parsing_config
   else
+    session[:csrf_token] = SecureRandom.hex
     haml :install
   end
 end
 
 post '/install' do
+  return [400, 'invalid token'] unless csrf_token_matches?(params[:token])
   begin
-    installer = Installer.new(params[:url])
+    if params[:url]
+      installer = Installer.new(params[:url])
+      installer.region = params[:region]
+      installer.size = params[:size]
+      session[:config] = installer.as_json
+    else
+      installer = Installer.from_json(session[:config])
+    end
   rescue
     haml :error_generic
   else
-    installer.region = params[:region]
-    installer.size = params[:size]
-    session[:config] = installer.as_json
-    if installer.auth_token = session[:token]
+    if authenticate(installer)
       begin
         installer.go!
-      rescue RestClient::Unauthorized
-        session[:token] = nil
-        redirect "https://cloud.digitalocean.com/v1/oauth/authorize?response_type=code&client_id=#{CLIENT_ID}&redirect_uri=#{CALLBACK_URL}&scope=read+write"
+      rescue Installer::NoSSHKeyError
+        redirect '/add_ssh_key'
       else
         session[:config] = installer.as_json
         redirect '/status'
       end
-    else
-      redirect "https://cloud.digitalocean.com/v1/oauth/authorize?response_type=code&client_id=#{CLIENT_ID}&redirect_uri=#{CALLBACK_URL}&scope=read+write"
     end
+  end
+end
+
+get '/update_regions_and_sizes' do
+  installer = Installer.new('https://github.com/seven1m/do-install-button') # doesn't matter
+  if authenticate(installer)
+    File.write('regions.json', installer.regions.to_json)
+    File.write('sizes.json', installer.sizes.to_json)
+    'written'
   end
 end
 
@@ -78,11 +112,25 @@ get '/auth/callback' do
       code:          params[:code],
       redirect_uri:  CALLBACK_URL }
   session[:token] = JSON.parse(result)['access_token']
+  unless session[:config]
+    redirect '/'
+    return
+  end
   installer = Installer.from_json(session[:config])
   installer.auth_token = session[:token]
-  installer.go!
-  session[:config] = installer.as_json
-  redirect '/status'
+  begin
+    installer.go!
+  rescue Installer::NoSSHKeyError
+    redirect '/add_ssh_key'
+  else
+    session[:config] = installer.as_json
+    redirect '/status'
+  end
+end
+
+get '/add_ssh_key' do
+  @installer = Installer.from_json(session[:config])
+  haml :add_ssh_key
 end
 
 get '/status' do
@@ -95,7 +143,8 @@ get '/status.json' do
   status = {
     id:       installer.droplet_id,
     ip:       installer.droplet_ip,
-    status:   installer.droplet_status
+    droplet:  installer.droplet_status,
+    status:   installer.install_status
   }
   content_type :json
   status.to_json
